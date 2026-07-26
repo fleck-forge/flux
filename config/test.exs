@@ -20,6 +20,11 @@ config :flux, FluxWeb.Endpoint,
 # Print only warnings and errors during test
 config :logger, level: :warning
 
+# Bind to a random free port instead of the real default, so the test suite
+# never collides with a real torrent client (or another test run) on the
+# same machine.
+config :flux, :torrent, listen_port: 0
+
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime
 

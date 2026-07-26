@@ -76,6 +76,10 @@ defmodule Flux.Downloads do
     update_download(download, %{state: :downloading, error_message: nil})
   end
 
+  def mark_paused(%Download{} = download) do
+    update_download(download, %{state: :paused})
+  end
+
   def delete_download(%Download{} = download) do
     download
     |> Repo.delete()

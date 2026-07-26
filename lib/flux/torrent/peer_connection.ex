@@ -63,14 +63,23 @@ defmodule Flux.Torrent.PeerConnection do
   end
 
   @doc """
-  Starts a connection for an inbound socket whose handshake has ALREADY
-  been read and validated by `Flux.Torrent.PeerListener` (which needs the
-  info_hash before it can even know which session to route to, so it reads
-  the handshake itself rather than handing a still-unread socket over).
+  Starts a connection for a peer whose handshake has ALREADY been read and
+  validated by `Flux.Torrent.PeerListener` (which needs the info_hash
+  before it can even know which session to route the connection to, so it
+  reads the handshake itself rather than handing a still-unread socket
+  over). The socket itself isn't passed yet — see `socket_ready/2`: TCP
+  ownership must be transferred to this process by its *current* owner
+  (the listener's accept loop) before anyone sets `active: :once` on it,
+  otherwise inbound data could be delivered to the wrong process. The
+  caller must call `:gen_tcp.controlling_process/2` and only then
+  `socket_ready/2`, in that order.
   """
-  def start_link_inbound_prehandshaked(socket, remote_peer_id, opts) do
-    GenServer.start_link(__MODULE__, {:inbound_prehandshaked, socket, remote_peer_id, opts})
+  def start_link_awaiting_socket(remote_peer_id, opts) do
+    GenServer.start_link(__MODULE__, {:awaiting_socket, remote_peer_id, opts})
   end
+
+  @doc "Hands off a socket already transferred (via `:gen_tcp.controlling_process/2`) to this process."
+  def socket_ready(pid, socket), do: GenServer.cast(pid, {:socket_ready, socket})
 
   @doc "Sends a raw wire message (already encoded via `WireProtocol.encode_message/1`)."
   def send_message(pid, message), do: GenServer.cast(pid, {:send, message})
@@ -92,7 +101,12 @@ defmodule Flux.Torrent.PeerConnection do
   @impl true
   def init({:outbound, address, port, opts}) do
     with {:ok, socket} <-
-           :gen_tcp.connect(address, port, [:binary, active: false, packet: :raw], @handshake_timeout) do
+           :gen_tcp.connect(
+             address,
+             port,
+             [:binary, active: false, packet: :raw],
+             @handshake_timeout
+           ) do
       state = build_state(socket, opts)
       do_outbound_handshake(state)
     else
@@ -105,14 +119,9 @@ defmodule Flux.Torrent.PeerConnection do
     do_inbound_handshake(state)
   end
 
-  def init({:inbound_prehandshaked, socket, remote_peer_id, opts}) do
-    state = %{build_state(socket, opts) | remote_peer_id: remote_peer_id}
-    handshake = WireProtocol.encode_handshake(state.info_hash, state.our_peer_id, extended_reserved())
-
-    case :gen_tcp.send(socket, handshake) do
-      :ok -> finish_handshake(state)
-      {:error, reason} -> {:stop, reason}
-    end
+  def init({:awaiting_socket, remote_peer_id, opts}) do
+    state = %{build_state(nil, opts) | remote_peer_id: remote_peer_id}
+    {:ok, state}
   end
 
   defp build_state(socket, opts) do
@@ -130,7 +139,8 @@ defmodule Flux.Torrent.PeerConnection do
   end
 
   defp do_outbound_handshake(state) do
-    handshake = WireProtocol.encode_handshake(state.info_hash, state.our_peer_id, extended_reserved())
+    handshake =
+      WireProtocol.encode_handshake(state.info_hash, state.our_peer_id, extended_reserved())
 
     with :ok <- :gen_tcp.send(state.socket, handshake),
          {:ok, remote_handshake_bin} <- :gen_tcp.recv(state.socket, 68, @handshake_timeout),
@@ -151,7 +161,8 @@ defmodule Flux.Torrent.PeerConnection do
          {:ok, %{info_hash: info_hash, peer_id: peer_id}, ""} <-
            WireProtocol.decode_handshake(handshake_bin),
          true <- info_hash == state.info_hash || {:error, :info_hash_mismatch} do
-      handshake = WireProtocol.encode_handshake(state.info_hash, state.our_peer_id, extended_reserved())
+      handshake =
+        WireProtocol.encode_handshake(state.info_hash, state.our_peer_id, extended_reserved())
 
       with :ok <- :gen_tcp.send(state.socket, handshake) do
         finish_handshake(%{state | remote_peer_id: peer_id})
@@ -175,7 +186,10 @@ defmodule Flux.Torrent.PeerConnection do
 
   defp send_extended_handshake(state) do
     payload =
-      WireProtocol.encode_extended_handshake(%{@ut_metadata_name => @our_ut_metadata_id}, state.metadata_size)
+      WireProtocol.encode_extended_handshake(
+        %{@ut_metadata_name => @our_ut_metadata_id},
+        state.metadata_size
+      )
 
     :gen_tcp.send(state.socket, payload)
   end
@@ -185,6 +199,24 @@ defmodule Flux.Torrent.PeerConnection do
   end
 
   @impl true
+  def handle_cast({:socket_ready, socket}, state) do
+    state = %{state | socket: socket}
+
+    handshake =
+      WireProtocol.encode_handshake(state.info_hash, state.our_peer_id, extended_reserved())
+
+    case :gen_tcp.send(socket, handshake) do
+      :ok ->
+        case finish_handshake(state) do
+          {:ok, state} -> {:noreply, state}
+          {:stop, reason} -> {:stop, reason, state}
+        end
+
+      {:error, reason} ->
+        {:stop, reason, state}
+    end
+  end
+
   def handle_cast({:send, message}, state) do
     send_wire(state, message)
     {:noreply, update_local_state(state, message)}
@@ -214,8 +246,11 @@ defmodule Flux.Torrent.PeerConnection do
     {:noreply, state}
   end
 
-  def handle_info({:tcp_closed, socket}, %{socket: socket} = state), do: disconnect(state, :tcp_closed)
-  def handle_info({:tcp_error, socket, reason}, %{socket: socket} = state), do: disconnect(state, reason)
+  def handle_info({:tcp_closed, socket}, %{socket: socket} = state),
+    do: disconnect(state, :tcp_closed)
+
+  def handle_info({:tcp_error, socket, reason}, %{socket: socket} = state),
+    do: disconnect(state, reason)
 
   def handle_info(:send_keep_alive, state) do
     send_wire(state, :keep_alive)
@@ -329,7 +364,11 @@ defmodule Flux.Torrent.PeerConnection do
         handle_ut_metadata_request(state, ext_id, piece_index)
 
       {:ok, {:data, piece_index, total_size, chunk}} ->
-        notify(state, {:metadata_piece_received, state.remote_peer_id, piece_index, total_size, chunk})
+        notify(
+          state,
+          {:metadata_piece_received, state.remote_peer_id, piece_index, total_size, chunk}
+        )
+
         state
 
       {:ok, {:reject, _piece_index}} ->

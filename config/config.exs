@@ -15,6 +15,11 @@ config :flux,
 # browser automatically when NO_WX=1 or wx isn't available (e.g. CI).
 config :desktop, :backend, :auto
 
+# BitTorrent engine: TCP port peers connect to us on (the conventional
+# BitTorrent range starts at 6881; 51413 — Transmission's historic default
+# — is used here to avoid colliding with other local torrent clients).
+config :flux, :torrent, listen_port: 51413
+
 # Configures the endpoint
 config :flux, FluxWeb.Endpoint,
   url: [host: "localhost"],

@@ -51,8 +51,8 @@ defmodule Flux.Torrent.WireProtocol do
     pstr_len = byte_size(@protocol_name)
 
     case binary do
-      <<^pstr_len, pstr::binary-size(pstr_len), reserved::binary-size(8), info_hash::binary-size(20),
-        peer_id::binary-size(20), rest::binary>>
+      <<^pstr_len, pstr::binary-size(pstr_len), reserved::binary-size(8),
+        info_hash::binary-size(20), peer_id::binary-size(20), rest::binary>>
       when pstr == @protocol_name ->
         {:ok, %{reserved: reserved, info_hash: info_hash, peer_id: peer_id}, rest}
 
@@ -108,7 +108,8 @@ defmodule Flux.Torrent.WireProtocol do
   there isn't yet a full frame available, so callers can accumulate more
   bytes from the socket and retry without losing data.
   """
-  @spec decode_message(binary()) :: {:ok, term(), binary()} | {:incomplete, binary()} | {:error, term()}
+  @spec decode_message(binary()) ::
+          {:ok, term(), binary()} | {:incomplete, binary()} | {:error, term()}
   def decode_message(binary) when byte_size(binary) < 4, do: {:incomplete, binary}
 
   def decode_message(<<0::32, rest::binary>>), do: {:ok, :keep_alive, rest}
@@ -191,7 +192,11 @@ defmodule Flux.Torrent.WireProtocol do
 
   @doc "Decodes a BEP 10 extended handshake payload (the bytes after the ext_id byte)."
   @spec decode_extended_handshake(binary()) ::
-          {:ok, %{extensions: %{String.t() => non_neg_integer()}, metadata_size: non_neg_integer() | nil}}
+          {:ok,
+           %{
+             extensions: %{String.t() => non_neg_integer()},
+             metadata_size: non_neg_integer() | nil
+           }}
           | {:error, term()}
   def decode_extended_handshake(payload) do
     with {:ok, dict, _rest} <- Bencode.decode(payload) do

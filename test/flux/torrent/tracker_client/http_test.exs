@@ -9,7 +9,9 @@ defmodule Flux.Torrent.TrackerClient.HttpTest do
   # full Plug/Bandit fixture for what's ultimately "respond with these
   # exact bytes."
   defp start_fake_tracker(response_body) do
-    {:ok, listen_socket} = :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+    {:ok, listen_socket} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
     {:ok, port} = :inet.port(listen_socket)
 
     parent = self()
@@ -43,7 +45,15 @@ defmodule Flux.Torrent.TrackerClient.HttpTest do
 
   test "announce/3 parses a compact-peers response" do
     peers_bin = <<127, 0, 0, 1, 6881::16>>
-    body = Bencode.encode([{"interval", 1800}, {"peers", peers_bin}, {"complete", 5}, {"incomplete", 2}])
+
+    body =
+      Bencode.encode([
+        {"interval", 1800},
+        {"peers", peers_bin},
+        {"complete", 5},
+        {"incomplete", 2}
+      ])
+
     port = start_fake_tracker(body)
 
     assert {:ok, result} = Http.announce("http://127.0.0.1:#{port}/announce", base_params())
@@ -78,7 +88,9 @@ defmodule Flux.Torrent.TrackerClient.HttpTest do
     params = %{base_params() | info_hash: <<0, 255, 32, 43, 126>>}
     body = Bencode.encode([{"interval", 1800}, {"peers", ""}])
 
-    {:ok, listen_socket} = :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+    {:ok, listen_socket} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
     {:ok, port} = :inet.port(listen_socket)
     parent = self()
 
@@ -88,7 +100,8 @@ defmodule Flux.Torrent.TrackerClient.HttpTest do
       send(parent, {:request, request})
 
       response =
-        "HTTP/1.1 200 OK\r\nContent-Length: #{byte_size(body)}\r\nConnection: close\r\n\r\n" <> body
+        "HTTP/1.1 200 OK\r\nContent-Length: #{byte_size(body)}\r\nConnection: close\r\n\r\n" <>
+          body
 
       :gen_tcp.send(client_socket, response)
       :gen_tcp.close(client_socket)

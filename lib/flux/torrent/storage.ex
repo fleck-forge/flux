@@ -63,7 +63,8 @@ defmodule Flux.Torrent.Storage do
 
     with :ok <- File.mkdir_p(save_path),
          {:ok, handles} <- open_all(layout, save_path) do
-      {:ok, %__MODULE__{meta_info: meta_info, save_path: save_path, layout: layout, handles: handles}}
+      {:ok,
+       %__MODULE__{meta_info: meta_info, save_path: save_path, layout: layout, handles: handles}}
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -152,10 +153,17 @@ defmodule Flux.Torrent.Storage do
       handle = Map.fetch!(state.handles, file.path)
 
       case :file.pread(handle, file_offset, len) do
-        {:ok, data} when byte_size(data) == len -> {:cont, {:ok, acc <> data}}
-        {:ok, short} -> {:cont, {:ok, acc <> short <> :binary.copy(<<0>>, len - byte_size(short))}}
-        :eof -> {:cont, {:ok, acc <> :binary.copy(<<0>>, len)}}
-        {:error, _} = error -> {:halt, error}
+        {:ok, data} when byte_size(data) == len ->
+          {:cont, {:ok, acc <> data}}
+
+        {:ok, short} ->
+          {:cont, {:ok, acc <> short <> :binary.copy(<<0>>, len - byte_size(short))}}
+
+        :eof ->
+          {:cont, {:ok, acc <> :binary.copy(<<0>>, len)}}
+
+        {:error, _} = error ->
+          {:halt, error}
       end
     end)
   end

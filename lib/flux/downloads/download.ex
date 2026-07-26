@@ -27,6 +27,11 @@ defmodule Flux.Downloads.Download do
     field :uploaded, :integer, default: 0
     field :error_message, :string
 
+    # JSON-encoded list of tracker tiers (`[["url1"],["url2","url3"]]`),
+    # per BEP 12 — these live in a .torrent's top-level dict, not in
+    # `info_dict`, so they need their own storage to survive a restart.
+    field :trackers, :string, default: "[]"
+
     timestamps(type: :utc_datetime, inserted_at: :created_at)
   end
 
@@ -45,7 +50,8 @@ defmodule Flux.Downloads.Download do
       :bitfield,
       :save_path,
       :uploaded,
-      :error_message
+      :error_message,
+      :trackers
     ])
     |> validate_required([:name, :info_hash, :total_length, :save_path])
     |> validate_number(:total_length, greater_than_or_equal_to: 0)

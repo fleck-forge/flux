@@ -67,8 +67,11 @@ defmodule Flux.Torrent.Bitfield do
 
     with true <- byte_size(binary) == expected_bytes || {:error, :wrong_length},
          true <- padding_zero?(binary, piece_count) || {:error, :nonzero_padding} do
-      <<bits::size(piece_count), _padding::bitstring>> = binary
-      {:ok, <<bits::size(piece_count)>>}
+      # Keep the full byte-padded form (matching `new/1`/`to_wire/1`) rather
+      # than truncating to exactly `piece_count` bits — callers that compare
+      # bit_size against `new/1`'s output (e.g. to validate an incoming wire
+      # bitfield is the right shape) need this to stay byte-aligned.
+      {:ok, binary}
     end
   end
 

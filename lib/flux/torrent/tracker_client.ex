@@ -24,7 +24,8 @@ defmodule Flux.Torrent.TrackerClient do
           leechers: non_neg_integer() | nil
         }
 
-  @callback announce(String.t(), params(), keyword()) :: {:ok, announce_result()} | {:error, term()}
+  @callback announce(String.t(), params(), keyword()) ::
+              {:ok, announce_result()} | {:error, term()}
 
   @doc "Dispatches to the HTTP or UDP tracker client based on `tracker_url`'s scheme."
   @spec dispatch(String.t(), params(), keyword()) :: {:ok, announce_result()} | {:error, term()}

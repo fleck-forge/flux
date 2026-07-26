@@ -28,8 +28,15 @@ defmodule Flux.Application do
          repos: Application.fetch_env!(:flux, :ecto_repos), skip: skip_migrations?()},
         {DNSCluster, query: Application.get_env(:flux, :dns_cluster_query) || :ignore},
         {Phoenix.PubSub, name: Flux.PubSub},
-        # Start a worker by calling: Flux.Worker.start_link(arg)
-        # {Flux.Worker, arg},
+        # BitTorrent engine: Registry maps info_hash -> Session.Worker pid
+        # (and {:session_sup, download_id} -> Session supervisor pid), the
+        # DynamicSupervisor holds one Session per active download, and the
+        # PeerListener accepts inbound peer connections so the engine is
+        # genuinely bidirectional (not just outbound-leech).
+        {Registry, keys: :unique, name: Flux.Torrent.Registry},
+        {DynamicSupervisor, name: Flux.Torrent.SessionSupervisor, strategy: :one_for_one},
+        {Flux.Torrent.PeerListener,
+         port: Application.get_env(:flux, :torrent, [])[:listen_port] || 51413},
         # Start to serve requests, typically the last entry
         FluxWeb.Endpoint
       ] ++ desktop_window_child()
@@ -37,7 +44,11 @@ defmodule Flux.Application do
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Flux.Supervisor]
-    Supervisor.start_link(children, opts)
+
+    with {:ok, pid} <- Supervisor.start_link(children, opts) do
+      unless @env == :test, do: Flux.Torrent.resume_incomplete_downloads()
+      {:ok, pid}
+    end
   end
 
   # Tell Phoenix to update the endpoint configuration

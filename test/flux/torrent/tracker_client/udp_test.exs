@@ -22,8 +22,8 @@ defmodule Flux.Torrent.TrackerClient.UdpTest do
       {:ok, {^client_ip, ^client_port, announce_req}} = :gen_udp.recv(socket, 0, 5000)
 
       <<^connection_id::64, 1::32, announce_txn_id::32, info_hash::binary-size(20),
-        peer_id::binary-size(20), downloaded::64, left::64, uploaded::64, event::32,
-        _ip::32, _key::32, _numwant::32-signed, port::16>> = announce_req
+        peer_id::binary-size(20), downloaded::64, left::64, uploaded::64, event::32, _ip::32,
+        _key::32, _numwant::32-signed, port::16>> = announce_req
 
       send(
         parent,
@@ -89,7 +89,9 @@ defmodule Flux.Torrent.TrackerClient.UdpTest do
   test "announce/3 encodes the started event correctly" do
     port = start_fake_tracker(1, %{interval: 1800, leechers: 0, seeders: 0, peers: <<>>})
 
-    assert {:ok, _} = Udp.announce("udp://127.0.0.1:#{port}", Map.put(base_params(), :event, :started))
+    assert {:ok, _} =
+             Udp.announce("udp://127.0.0.1:#{port}", Map.put(base_params(), :event, :started))
+
     assert_receive {:announce_received, %{event: 2}}, 1000
   end
 end

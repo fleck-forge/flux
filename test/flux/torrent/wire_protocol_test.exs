@@ -15,6 +15,7 @@ defmodule Flux.Torrent.WireProtocolTest do
 
     test "round-trips" do
       encoded = WP.encode_handshake(@info_hash, @peer_id)
+
       assert {:ok, %{info_hash: ih, peer_id: pid, reserved: reserved}, ""} =
                WP.decode_handshake(encoded)
 
@@ -35,7 +36,7 @@ defmodule Flux.Torrent.WireProtocolTest do
     end
 
     test "rejects a bad protocol string" do
-      bad = <<19, "Not BitTorrent proto", 0::size(8*8), @info_hash::binary, @peer_id::binary>>
+      bad = <<19, "Not BitTorrent proto", 0::size(8 * 8), @info_hash::binary, @peer_id::binary>>
       assert {:error, :bad_protocol} = WP.decode_handshake(bad)
     end
 
@@ -116,6 +117,7 @@ defmodule Flux.Torrent.WireProtocolTest do
     test "round-trips supported extensions and metadata_size" do
       encoded = WP.encode_extended_handshake(%{"ut_metadata" => 1}, 1234)
       assert {:ok, {:extended, 0, payload}, ""} = WP.decode_message(encoded)
+
       assert {:ok, %{extensions: %{"ut_metadata" => 1}, metadata_size: 1234}} =
                WP.decode_extended_handshake(payload)
     end
@@ -149,7 +151,9 @@ defmodule Flux.Torrent.WireProtocolTest do
       last_piece_index = div(byte_size(@raw_info_bytes), 16_384)
       encoded = WP.encode_ut_metadata_data(1, last_piece_index, @raw_info_bytes)
       assert {:ok, {:extended, 1, payload}, ""} = WP.decode_message(encoded)
-      assert {:ok, {:data, ^last_piece_index, _total_size, chunk}} = WP.decode_ut_metadata(payload)
+
+      assert {:ok, {:data, ^last_piece_index, _total_size, chunk}} =
+               WP.decode_ut_metadata(payload)
 
       expected_len = byte_size(@raw_info_bytes) - last_piece_index * 16_384
       assert byte_size(chunk) == expected_len

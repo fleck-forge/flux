@@ -61,7 +61,6 @@ defmodule Flux.Torrent.StorageTest do
       assert Flux.Torrent.Bitfield.has?(bitfield, 0)
       refute Flux.Torrent.Bitfield.has?(bitfield, 1)
     end
-
   end
 
   describe "multi-file torrent with a block straddling a file boundary" do

@@ -79,7 +79,8 @@ defmodule Flux.Torrent.PiecePicker do
   or `:none` if `peer_id` has nothing we currently need (or everything
   needed from them is already requested and we're not yet in endgame).
   """
-  @spec next_request(t(), term()) :: {:ok, {non_neg_integer(), non_neg_integer(), pos_integer()}} | :none
+  @spec next_request(t(), term()) ::
+          {:ok, {non_neg_integer(), non_neg_integer(), pos_integer()}} | :none
   def next_request(state, peer_id) do
     case Map.get(state.peer_bitfields, peer_id) do
       nil ->

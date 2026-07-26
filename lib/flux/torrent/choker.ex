@@ -17,7 +17,9 @@ defmodule Flux.Torrent.Choker do
   for every peer. Pass `optimistic?: true` (e.g. every 3rd tick) to also
   unchoke one additional random interested peer beyond the top-N.
   """
-  @spec decide(%{term() => peer_state()}, pos_integer(), keyword()) :: %{term() => :choke | :unchoke}
+  @spec decide(%{term() => peer_state()}, pos_integer(), keyword()) :: %{
+          term() => :choke | :unchoke
+        }
   def decide(peers_state, unchoke_slots \\ @default_unchoke_slots, opts \\ []) do
     interested = for {id, %{interested: true} = s} <- peers_state, do: {id, s}
 
