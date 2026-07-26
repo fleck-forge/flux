@@ -100,18 +100,15 @@ defmodule Flux.Torrent.PeerConnection do
 
   @impl true
   def init({:outbound, address, port, opts}) do
-    with {:ok, socket} <-
-           :gen_tcp.connect(
-             address,
-             port,
-             [:binary, active: false, packet: :raw],
-             @handshake_timeout
-           ) do
-      state = build_state(socket, opts)
-      do_outbound_handshake(state)
-    else
-      {:error, reason} -> {:stop, reason}
-    end
+    # The actual connect + handshake happens in handle_continue/2, not
+    # here: init/1 must return quickly so `DynamicSupervisor.start_child`
+    # (called once per candidate peer from Session.Worker) doesn't block —
+    # with dozens of candidate peers per announce and most real-world
+    # peers being slow or unreachable (NAT), doing this synchronously in
+    # init/1 serialized every connection attempt behind the last one's
+    # full ~10s timeout, stalling the whole session for minutes.
+    state = %{build_state(nil, opts) | remote_address: {address, port}}
+    {:ok, state, {:continue, :connect_outbound}}
   end
 
   def init({:inbound, socket, opts}) do
@@ -122,6 +119,25 @@ defmodule Flux.Torrent.PeerConnection do
   def init({:awaiting_socket, remote_peer_id, opts}) do
     state = %{build_state(nil, opts) | remote_peer_id: remote_peer_id}
     {:ok, state}
+  end
+
+  @impl true
+  def handle_continue(:connect_outbound, %{remote_address: {address, port}} = state) do
+    case :gen_tcp.connect(
+           address,
+           port,
+           [:binary, active: false, packet: :raw],
+           @handshake_timeout
+         ) do
+      {:ok, socket} ->
+        case do_outbound_handshake(%{state | socket: socket}) do
+          {:ok, state} -> {:noreply, state}
+          {:stop, reason} -> {:stop, reason, state}
+        end
+
+      {:error, reason} ->
+        {:stop, reason, state}
+    end
   end
 
   defp build_state(socket, opts) do

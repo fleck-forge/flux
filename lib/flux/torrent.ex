@@ -95,6 +95,34 @@ defmodule Flux.Torrent do
     end
   end
 
+  @empty_stats %{peer_count: 0, connecting_count: 0, tracker_seeders: nil, tracker_leechers: nil}
+
+  @doc """
+  Live, in-memory stats for a running session — connected/connecting peer
+  count and the last tracker-reported seeder/leecher count (`nil` until the
+  first successful announce). Returns zeroed-out stats (not an error) for a
+  download with no active session (paused, failed, or not yet resumed after
+  boot), since "no live session" and "zero peers" look the same to a caller.
+  """
+  @spec stats(binary()) :: %{
+          peer_count: non_neg_integer(),
+          connecting_count: non_neg_integer(),
+          tracker_seeders: non_neg_integer() | nil,
+          tracker_leechers: non_neg_integer() | nil
+        }
+  def stats(info_hash) do
+    case Registry.lookup(Flux.Torrent.Registry, info_hash) do
+      [{pid, _}] -> safe_stats(pid)
+      [] -> @empty_stats
+    end
+  end
+
+  defp safe_stats(pid) do
+    GenServer.call(pid, :stats, 2000)
+  catch
+    :exit, _ -> @empty_stats
+  end
+
   defp delete_files(%{info_dict: nil}), do: :ok
 
   defp delete_files(download) do

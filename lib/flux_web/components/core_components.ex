@@ -393,6 +393,56 @@ defmodule FluxWeb.CoreComponents do
   end
 
   @doc """
+  Renders a modal, controlled by the `show` assign (not client-only JS
+  toggling) so the parent LiveView can close it server-side after a
+  successful action (e.g. once an add-torrent form submission succeeds).
+
+  ## Examples
+
+      <.modal id="add-torrent-modal" show={@show_add_modal}>
+        This is a modal.
+      </.modal>
+  """
+  attr :id, :string, required: true
+  attr :show, :boolean, default: false
+  attr :on_close, :string, default: nil, doc: "the phx-click event name for the close button"
+  slot :inner_block, required: true
+
+  def modal(assigns) do
+    ~H"""
+    <div :if={@show} id={@id} class="fixed inset-0 z-50">
+      <div class="bg-base-content/50 fixed inset-0" aria-hidden="true" />
+      <div class="fixed inset-0 overflow-y-auto" role="dialog" aria-modal="true" tabindex="0">
+        <div class="flex min-h-full items-center justify-center">
+          <div class="w-full max-w-lg p-4 sm:p-6 lg:py-8">
+            <.focus_wrap
+              id={"#{@id}-container"}
+              phx-window-keydown={@on_close && JS.push(@on_close)}
+              phx-key="escape"
+              class="shadow-base-content/10 ring-base-content/10 relative rounded-2xl bg-base-100 p-6 shadow-lg ring-1"
+            >
+              <div :if={@on_close} class="absolute top-4 right-4">
+                <button
+                  phx-click={@on_close}
+                  type="button"
+                  class="-m-2 flex-none p-2 opacity-40 hover:opacity-70"
+                  aria-label={gettext("close")}
+                >
+                  <.icon name="hero-x-mark" class="size-5" />
+                </button>
+              </div>
+              <div id={"#{@id}-content"}>
+                {render_slot(@inner_block)}
+              </div>
+            </.focus_wrap>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  @doc """
   Renders a [Heroicon](https://heroicons.com).
 
   Heroicons come in three styles – outline, solid, and mini.

@@ -11,7 +11,10 @@ defmodule Flux.Torrent.TrackerClient.Udp do
   alias Flux.Torrent.TrackerClient
 
   @protocol_magic 0x41727101980
-  @max_connect_attempts 4
+  # Kept low: Session.Worker now falls back to the next tracker in the
+  # torrent's list on any failure, so a single dead/unreachable UDP tracker
+  # only needs to fail fast here, not exhaust a long retry budget itself.
+  @max_connect_attempts 2
 
   @impl true
   def announce(tracker_url, params, opts \\ []) do

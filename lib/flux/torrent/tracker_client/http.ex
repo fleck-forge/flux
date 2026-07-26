@@ -15,7 +15,11 @@ defmodule Flux.Torrent.TrackerClient.Http do
     url = tracker_url <> separator(tracker_url) <> build_query(params)
     timeout = Keyword.get(opts, :receive_timeout, 15_000)
 
-    case Req.get(url, decode_body: false, receive_timeout: timeout) do
+    # `retry: false`: Session.Worker already falls back to the next
+    # tracker in the torrent's list on any failure, so Req's default
+    # automatic retry-with-backoff (~7s across 3 attempts) for this single
+    # tracker would only add redundant delay before that fallback kicks in.
+    case Req.get(url, decode_body: false, receive_timeout: timeout, retry: false) do
       {:ok, %{status: 200, body: body}} -> parse_response(body)
       {:ok, %{status: status}} -> {:error, {:http_status, status}}
       {:error, reason} -> {:error, reason}

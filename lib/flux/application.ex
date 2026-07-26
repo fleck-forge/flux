@@ -37,6 +37,9 @@ defmodule Flux.Application do
         {DynamicSupervisor, name: Flux.Torrent.SessionSupervisor, strategy: :one_for_one},
         {Flux.Torrent.PeerListener,
          port: Application.get_env(:flux, :torrent, [])[:listen_port] || 51413},
+        # One DHT node and one shared uTP socket for the whole app (not per
+        # torrent) — matches how real clients run exactly one of each.
+        {Flux.Torrent.Dht, port: Application.get_env(:flux, :torrent, [])[:dht_port] || 6881},
         # Start to serve requests, typically the last entry
         FluxWeb.Endpoint
       ] ++ desktop_window_child()

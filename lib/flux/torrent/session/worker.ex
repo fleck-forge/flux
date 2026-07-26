@@ -34,6 +34,7 @@ defmodule Flux.Torrent.Session.Worker do
   @block_size 16_384
   @max_peers 30
   @choke_interval 10_000
+  @peer_fill_interval 5_000
   @min_announce_interval 30
 
   defstruct [
@@ -44,9 +45,13 @@ defmodule Flux.Torrent.Session.Worker do
     :meta_info,
     :storage_pid,
     trackers: [],
+    tracker_index: 0,
     peers: %{},
     peer_info: %{},
+    peer_addresses: %{},
     pending: %{},
+    known_peers: MapSet.new(),
+    tried_peers: MapSet.new(),
     choke_state: %{},
     unchoked_by: MapSet.new(),
     picker: nil,
@@ -57,7 +62,9 @@ defmodule Flux.Torrent.Session.Worker do
     tick_count: 0,
     metadata_chunks: %{},
     metadata_total_size: nil,
-    metadata_requested_from: nil
+    metadata_requested_from: nil,
+    tracker_seeders: nil,
+    tracker_leechers: nil
   ]
 
   def start_link(download_id), do: GenServer.start_link(__MODULE__, download_id)
@@ -155,6 +162,7 @@ defmodule Flux.Torrent.Session.Worker do
       }
 
       schedule_choke_tick()
+      schedule_peer_fill_tick()
       schedule_announce(0)
       {:ok, state}
     else
@@ -184,6 +192,16 @@ defmodule Flux.Torrent.Session.Worker do
   def handle_call(:pause, _from, state), do: {:reply, :ok, state}
   def handle_call({:remove, _delete_files?}, _from, state), do: {:reply, :ok, state}
 
+  def handle_call(:stats, _from, state) do
+    {:reply,
+     %{
+       peer_count: map_size(state.peers),
+       connecting_count: map_size(state.pending),
+       tracker_seeders: state.tracker_seeders,
+       tracker_leechers: state.tracker_leechers
+     }, state}
+  end
+
   ## handle_info — announce loop, choke tick, peer-process monitoring
 
   @impl true
@@ -200,10 +218,38 @@ defmodule Flux.Torrent.Session.Worker do
     {:noreply, %{state | tick_count: state.tick_count + 1}}
   end
 
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
+  # Tops up peer connections independently of the tracker announce cycle
+  # (which can be many minutes apart) — without this, a failed/disconnected
+  # peer or a connection attempt that never panned out just sits empty
+  # until the next scheduled announce. This keeps retrying from the full
+  # set of peers this session has ever learned about (not just the most
+  # recent announce's list), so a peer that failed once isn't permanently
+  # given up on.
+  def handle_info(:peer_fill_tick, state) do
+    schedule_peer_fill_tick()
+    {:noreply, connect_to_peers(state, MapSet.to_list(state.known_peers))}
+  end
+
+  def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
     case Map.get(state.peer_info, pid) do
-      nil -> {:noreply, %{state | pending: Map.delete(state.pending, pid)}}
-      peer_id -> {:noreply, remove_peer(state, peer_id, pid)}
+      nil ->
+        # Never finished handshaking — connect/handshake failure surfaces
+        # here (as this monitored process exiting), not as an error return
+        # from starting it, since the connect itself is asynchronous now.
+        case Map.get(state.pending, pid) do
+          {ip, port} ->
+            Logger.debug(
+              "Session.Worker: connection to #{:inet.ntoa(ip)}:#{port} failed (#{inspect(reason)})"
+            )
+
+          nil ->
+            :ok
+        end
+
+        {:noreply, %{state | pending: Map.delete(state.pending, pid)}}
+
+      peer_id ->
+        {:noreply, remove_peer(state, peer_id, pid)}
     end
   end
 
@@ -215,6 +261,7 @@ defmodule Flux.Torrent.Session.Worker do
       state
       | peers: Map.put(state.peers, peer_id, pid),
         peer_info: Map.put(state.peer_info, pid, peer_id),
+        peer_addresses: put_address(state.peer_addresses, peer_id, Map.get(state.pending, pid)),
         pending: Map.delete(state.pending, pid),
         choke_state: Map.put(state.choke_state, peer_id, %{interested: false, download_rate: 0})
     }
@@ -347,20 +394,52 @@ defmodule Flux.Torrent.Session.Worker do
 
         case TrackerClient.dispatch(tracker_url, params, []) do
           {:ok, %{interval: interval} = result} ->
+            Logger.debug(
+              "Session.Worker: #{tracker_url} returned #{length(result.peers)} peer(s) " <>
+                "(seeders=#{inspect(result.seeders)}, leechers=#{inspect(result.leechers)})"
+            )
+
+            state = %{
+              state
+              | known_peers: MapSet.union(state.known_peers, MapSet.new(result.peers))
+            }
+
             state = connect_to_peers(state, result.peers)
             schedule_announce(max(interval, @min_announce_interval))
-            %{state | announced?: true}
+
+            %{
+              state
+              | announced?: true,
+                tracker_seeders: result.seeders,
+                tracker_leechers: result.leechers
+            }
 
           {:error, reason} ->
-            Logger.warning("Session.Worker: tracker announce failed (#{inspect(reason)})")
-            schedule_announce(60)
-            state
+            Logger.warning(
+              "Session.Worker: announce to #{tracker_url} failed (#{inspect(reason)}), trying next tracker"
+            )
+
+            # Fall back to the next tracker in the (flattened, tier-ordered)
+            # list rather than retrying the same one forever — a single
+            # unreachable/dead tracker must not permanently stall the
+            # session when the torrent lists working alternatives.
+            schedule_announce(5)
+            %{state | tracker_index: state.tracker_index + 1}
         end
     end
   end
 
+  # BEP 12 announce-list, flattened into one ordered fallback list (tier
+  # order preserved). `tracker_index` only ever increases and wraps via
+  # `rem/2` here — it's not reset on success, so a subsequent scheduled
+  # re-announce keeps using whichever tracker most recently worked instead
+  # of hopping back to a possibly-dead primary.
   defp current_tracker(%{trackers: []}), do: nil
-  defp current_tracker(%{trackers: [tier | _]}), do: List.first(tier)
+
+  defp current_tracker(state) do
+    flat = List.flatten(state.trackers)
+    Enum.at(flat, rem(state.tracker_index, length(flat)))
+  end
 
   defp left_bytes(%{meta_info: nil}), do: 0
   defp left_bytes(state), do: max(state.meta_info.total_length - state.downloaded, 0)
@@ -372,17 +451,33 @@ defmodule Flux.Torrent.Session.Worker do
   defp schedule_announce(seconds), do: Process.send_after(self(), :announce, seconds * 1000)
   defp schedule_choke_tick, do: Process.send_after(self(), :choke_tick, @choke_interval)
 
+  defp schedule_peer_fill_tick,
+    do: Process.send_after(self(), :peer_fill_tick, @peer_fill_interval)
+
   defp connect_to_peers(state, peer_list) do
-    already_connecting = MapSet.new(Map.values(state.pending))
+    active = MapSet.new(Map.values(state.pending) ++ Map.values(state.peer_addresses))
     slots = @max_peers - map_size(state.peers) - map_size(state.pending)
 
-    peer_list
-    |> Enum.reject(fn addr -> MapSet.member?(already_connecting, addr) end)
+    candidates = Enum.reject(peer_list, fn addr -> MapSet.member?(active, addr) end)
+
+    # Never-tried addresses first, previously-failed ones only to fill any
+    # remaining slots — otherwise a handful of addresses that failed once
+    # immediately become eligible again (nothing else marks them as
+    # recently-failed) and, since candidate ordering is otherwise stable,
+    # just keep winning the same slots forever while the rest of a large
+    # swarm (where most real connect failures come from ordinary NAT'd
+    # peers, not anything wrong on our end) never gets a first attempt.
+    {untried, previously_tried} =
+      Enum.split_with(candidates, &(not MapSet.member?(state.tried_peers, &1)))
+
+    (untried ++ previously_tried)
     |> Enum.take(max(slots, 0))
     |> Enum.reduce(state, fn {ip, port}, acc -> start_peer_connection(acc, ip, port) end)
   end
 
   defp start_peer_connection(state, ip, port) do
+    state = %{state | tried_peers: MapSet.put(state.tried_peers, {ip, port})}
+
     opts = [
       session_pid: self(),
       info_hash: state.info_hash,
@@ -411,7 +506,15 @@ defmodule Flux.Torrent.Session.Worker do
         Process.monitor(pid)
         %{state | pending: Map.put(state.pending, pid, {ip, port})}
 
-      _ ->
+      {:error, reason} ->
+        # The connect itself is async (handled by the started process via
+        # handle_continue) and reported later via :DOWN if it fails — this
+        # branch only fires for a supervisor-level failure to even start
+        # the child process (e.g. hitting :max_children).
+        Logger.debug(
+          "Session.Worker: could not start a connection process for #{:inet.ntoa(ip)}:#{port} (#{inspect(reason)})"
+        )
+
         state
     end
   end
@@ -458,11 +561,15 @@ defmodule Flux.Torrent.Session.Worker do
       state
       | peers: Map.delete(state.peers, peer_id),
         peer_info: if(pid, do: Map.delete(state.peer_info, pid), else: state.peer_info),
+        peer_addresses: Map.delete(state.peer_addresses, peer_id),
         choke_state: Map.delete(state.choke_state, peer_id),
         unchoked_by: MapSet.delete(state.unchoked_by, peer_id),
         picker: state.picker && PiecePicker.release_peer(state.picker, peer_id)
     }
   end
+
+  defp put_address(addresses, _peer_id, nil), do: addresses
+  defp put_address(addresses, peer_id, address), do: Map.put(addresses, peer_id, address)
 
   defp update(state, key, fun), do: Map.update!(state, key, fun)
 

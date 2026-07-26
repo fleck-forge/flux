@@ -71,11 +71,18 @@ defmodule Flux.Torrent.PeerConnectionTest do
 
     task = Task.async(fn -> accept_and_handshake(listen_socket, info_hash: wrong_hash) end)
 
+    # The connect + handshake happens asynchronously (handle_continue), so
+    # start_link_outbound itself always succeeds immediately — the
+    # mismatch is discovered slightly later and surfaces as this monitored
+    # process exiting, not as an error return from starting it. Trap exits
+    # so the (linked) PeerConnection's abnormal exit doesn't crash this
+    # test process too.
     Process.flag(:trap_exit, true)
-    result = start_outbound(port, [])
+    {:ok, pid} = start_outbound(port, [])
+    ref = Process.monitor(pid)
     Task.await(task)
 
-    assert {:error, :info_hash_mismatch} = result
+    assert_receive {:DOWN, ^ref, :process, ^pid, :info_hash_mismatch}, 1000
   end
 
   test "exchanges bitfields after handshake" do

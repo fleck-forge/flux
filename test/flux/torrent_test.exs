@@ -19,7 +19,7 @@ defmodule Flux.TorrentTest do
     {:ok, port} = :inet.port(listen_socket)
 
     spawn_link(fn ->
-      {:ok, socket} = :gen_tcp.accept(listen_socket, 5000)
+      {:ok, socket} = :gen_tcp.accept(listen_socket, 15_000)
       {:ok, handshake_bin} = :gen_tcp.recv(socket, 68, 2000)
       {:ok, %{info_hash: ^info_hash}, ""} = WireProtocol.decode_handshake(handshake_bin)
 
@@ -82,7 +82,7 @@ defmodule Flux.TorrentTest do
   end
 
   defp accept_announce_loop(listen_socket, peer_port) do
-    case :gen_tcp.accept(listen_socket, 5000) do
+    case :gen_tcp.accept(listen_socket, 20_000) do
       {:ok, socket} ->
         {:ok, _request} = :gen_tcp.recv(socket, 0, 2000)
 
@@ -139,7 +139,129 @@ defmodule Flux.TorrentTest do
     assert {:ok, on_disk} = File.read(Path.join(tmp_dir, "fixture.bin"))
     assert on_disk == content
 
+    # The fake peer stays connected throughout (never closes its socket),
+    # so live stats should still show it even after completion.
+    assert %{peer_count: 1} = Torrent.stats(info_hash)
+
     Torrent.remove(info_hash, false)
+  end
+
+  test "falls back to the next tracker in the list when the first one is unreachable", %{
+    tmp_dir: tmp_dir
+  } do
+    content = :binary.copy(<<5, 6, 7, 8>>, 8)
+    piece_length = 16
+    pieces = for <<chunk::binary-size(16) <- content>>, do: :crypto.hash(:sha, chunk)
+
+    info_pairs = [
+      {"length", byte_size(content)},
+      {"name", "fallback.bin"},
+      {"piece length", piece_length},
+      {"pieces", Enum.join(pieces)}
+    ]
+
+    raw_info_bytes = Bencode.encode(info_pairs)
+    info_hash = :crypto.hash(:sha, raw_info_bytes)
+
+    peer_port = start_fake_peer(info_hash, content, piece_length)
+    tracker_port = start_fake_tracker(peer_port)
+
+    # An unsupported scheme fails synchronously in TrackerClient.dispatch/3
+    # with zero network I/O — a deterministic "this tracker is broken" case
+    # that doesn't depend on OS-level connection-refused/retry timing.
+    top_pairs = [
+      {"announce-list",
+       [
+         ["ftp://tracker.invalid/announce"],
+         ["http://127.0.0.1:#{tracker_port}/announce"]
+       ]},
+      {"info", info_pairs}
+    ]
+
+    raw_torrent = Bencode.encode(top_pairs)
+
+    assert {:ok, _download_id} = Torrent.add_torrent_file(raw_torrent, tmp_dir)
+
+    download = wait_until_completed(info_hash, 100)
+    assert download.state == :completed
+
+    Torrent.remove(info_hash, false)
+  end
+
+  test "retries connecting to a peer that failed on the first attempt, without waiting for another announce",
+       %{tmp_dir: tmp_dir} do
+    content = :binary.copy(<<9, 10, 11, 12>>, 8)
+    piece_length = 16
+    pieces = for <<chunk::binary-size(16) <- content>>, do: :crypto.hash(:sha, chunk)
+
+    info_pairs = [
+      {"length", byte_size(content)},
+      {"name", "retry.bin"},
+      {"piece length", piece_length},
+      {"pieces", Enum.join(pieces)}
+    ]
+
+    raw_info_bytes = Bencode.encode(info_pairs)
+    info_hash = :crypto.hash(:sha, raw_info_bytes)
+
+    # A "flaky" peer: the first connection is accepted then dropped
+    # immediately with no handshake reply (simulating a failed first
+    # attempt); the second connection (from the periodic peer-fill retry,
+    # not a fresh announce — the tracker's announce interval here is
+    # deliberately huge) behaves like a normal, fully-seeded peer.
+    {:ok, listen_socket} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, peer_port} = :inet.port(listen_socket)
+
+    spawn_link(fn ->
+      {:ok, first} = :gen_tcp.accept(listen_socket, 5000)
+      :gen_tcp.close(first)
+
+      {:ok, socket} = :gen_tcp.accept(listen_socket, 15_000)
+      {:ok, handshake_bin} = :gen_tcp.recv(socket, 68, 2000)
+      {:ok, %{info_hash: ^info_hash}, ""} = WireProtocol.decode_handshake(handshake_bin)
+
+      reply = WireProtocol.encode_handshake(info_hash, :crypto.hash(:sha, "flaky-peer"))
+      :ok = :gen_tcp.send(socket, reply)
+
+      piece_count = ceil(byte_size(content) / piece_length)
+      pad = rem(8 - rem(piece_count, 8), 8)
+      all_ones = Bitwise.bsl(1, piece_count) - 1
+      bits = <<all_ones::size(piece_count), 0::size(pad)>>
+
+      :gen_tcp.send(socket, WireProtocol.encode_message({:bitfield, bits}))
+      :gen_tcp.send(socket, WireProtocol.encode_message(:unchoke))
+
+      serve_loop(socket, content, piece_length)
+    end)
+
+    tracker_port = start_fake_tracker(peer_port)
+
+    top_pairs = [
+      {"announce", "http://127.0.0.1:#{tracker_port}/announce"},
+      {"info", info_pairs}
+    ]
+
+    raw_torrent = Bencode.encode(top_pairs)
+
+    assert {:ok, _download_id} = Torrent.add_torrent_file(raw_torrent, tmp_dir)
+
+    download = wait_until_completed(info_hash, 100)
+    assert download.state == :completed
+
+    Torrent.remove(info_hash, false)
+  end
+
+  test "stats/1 returns zeroed-out stats when no session is running for that info_hash" do
+    info_hash = :crypto.hash(:sha, "no-such-session-#{System.unique_integer()}")
+
+    assert Torrent.stats(info_hash) == %{
+             peer_count: 0,
+             connecting_count: 0,
+             tracker_seeders: nil,
+             tracker_leechers: nil
+           }
   end
 
   defp wait_until_completed(_info_hash, 0), do: flunk("download did not complete in time")

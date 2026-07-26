@@ -20,6 +20,21 @@ if System.get_env("PHX_SERVER") do
   config :flux, FluxWeb.Endpoint, server: true
 end
 
+# Default root directory downloads are saved under (files land at
+# `download_dir/<name>`, or `download_dir/<name>/...` for multi-file
+# torrents, since MetaInfo already prefixes multi-file paths with the
+# torrent name — see Flux.Torrent's moduledoc). Test gets an isolated
+# repo-relative directory so the suite never touches a real home dir.
+download_dir =
+  System.get_env("FLUX_DOWNLOAD_DIR") ||
+    if config_env() == :test do
+      Path.expand("../tmp/test_downloads", __DIR__)
+    else
+      Path.join(System.get_env("HOME") || System.tmp_dir!(), "Downloads")
+    end
+
+config :flux, :torrent, download_dir: download_dir
+
 if config_env() == :prod do
   # Installed desktop apps have no shell to export env vars in, so default to
   # a per-user data directory instead of requiring DATABASE_PATH. It can
