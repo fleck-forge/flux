@@ -39,7 +39,9 @@ defmodule Flux.Torrent.DhtTest do
     :gen_udp.close(socket)
   end
 
-  test "responds to find_node with a well-formed (possibly empty) node list", %{dht_port: dht_port} do
+  test "responds to find_node with a well-formed (possibly empty) node list", %{
+    dht_port: dht_port
+  } do
     socket = open_fake_node()
     target = :crypto.hash(:sha, "some-target")
     packet = Krpc.encode_query("t2", "find_node", [{"id", @our_test_id}, {"target", target}])
@@ -52,12 +54,16 @@ defmodule Flux.Torrent.DhtTest do
     :gen_udp.close(socket)
   end
 
-  test "responds to get_peers with a token and nodes (v1 never returns values for others' torrents)", %{
-    dht_port: dht_port
-  } do
+  test "responds to get_peers with a token and nodes (v1 never returns values for others' torrents)",
+       %{
+         dht_port: dht_port
+       } do
     socket = open_fake_node()
     info_hash = :crypto.hash(:sha, "some-torrent")
-    packet = Krpc.encode_query("t3", "get_peers", [{"id", @our_test_id}, {"info_hash", info_hash}])
+
+    packet =
+      Krpc.encode_query("t3", "get_peers", [{"id", @our_test_id}, {"info_hash", info_hash}])
+
     :ok = :gen_udp.send(socket, {127, 0, 0, 1}, dht_port, packet)
 
     {msg, _ip, _port} = recv_krpc(socket)
@@ -68,13 +74,16 @@ defmodule Flux.Torrent.DhtTest do
     :gen_udp.close(socket)
   end
 
-  test "accepts announce_peer with a valid token (obtained from get_peers) and rejects a bad one", %{
-    dht_port: dht_port
-  } do
+  test "accepts announce_peer with a valid token (obtained from get_peers) and rejects a bad one",
+       %{
+         dht_port: dht_port
+       } do
     socket = open_fake_node()
     info_hash = :crypto.hash(:sha, "announce-torrent")
 
-    gp_packet = Krpc.encode_query("t4", "get_peers", [{"id", @our_test_id}, {"info_hash", info_hash}])
+    gp_packet =
+      Krpc.encode_query("t4", "get_peers", [{"id", @our_test_id}, {"info_hash", info_hash}])
+
     :ok = :gen_udp.send(socket, {127, 0, 0, 1}, dht_port, gp_packet)
     {%{token: token}, _ip, _port} = recv_krpc(socket)
 
@@ -136,9 +145,18 @@ defmodule Flux.Torrent.DhtTest do
 
   test "get_peers/2 discovers peers via a fake node already in the routing table" do
     fake_node_socket = open_fake_node()
-    fake_node_id = :crypto.hash(:sha, "seeded-node-#{System.unique_integer()}")
     info_hash = :crypto.hash(:sha, "lookup-target-#{System.unique_integer()}")
     real_peer = {{203, 0, 113, 5}, 51413}
+
+    # This `Dht` GenServer is a single app-wide singleton, and if the test
+    # environment has real internet access, its routing table may already
+    # hold real mainline DHT nodes from a genuine bootstrap — not just this
+    # file's other fake ones. Craft the fake node's id to have the minimum
+    # possible (non-zero) XOR distance to `info_hash`, guaranteeing it's the
+    # closest entry in the table no matter what else has accumulated there,
+    # so the lookup queries it in the very first round regardless.
+    <<prefix::binary-size(19), last_byte>> = info_hash
+    fake_node_id = <<prefix::binary, Bitwise.bxor(last_byte, 1)>>
 
     # Seed our routing table with this fake node the same way a real one
     # would appear: it queries us first (any incoming query registers the
@@ -154,7 +172,10 @@ defmodule Flux.Torrent.DhtTest do
         {peer_ip, peer_port} = real_peer
         {a, b, c, d} = peer_ip
         values = [<<a, b, c, d, peer_port::16>>]
-        reply = Krpc.encode_response(tid, [{"id", fake_node_id}, {"token", "tok"}, {"values", values}])
+
+        reply =
+          Krpc.encode_response(tid, [{"id", fake_node_id}, {"token", "tok"}, {"values", values}])
+
         :gen_udp.send(fake_node_socket, ip, port, reply)
       end)
 

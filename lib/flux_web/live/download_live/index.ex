@@ -618,7 +618,7 @@ defmodule FluxWeb.DownloadLive.Index do
         />
         <div class="text-xs text-base-content/60 mt-0.5 flex items-center gap-2">
           <span class={["badge badge-xs", state_badge_class(@download.state)]}>
-            {@download.state}
+            {state_label(@download)}
           </span>
           <span>{progress_percent(@download)}%</span>
           <span :if={@download.state == :downloading}>
@@ -647,7 +647,11 @@ defmodule FluxWeb.DownloadLive.Index do
     ~H"""
     <h2 class="text-lg font-semibold mb-4 truncate">{@download.name}</h2>
     <.list>
-      <:item title="State">{@download.state}</:item>
+      <:item title="State">{state_label(@download)}</:item>
+      <:item :if={@download.state == :completed and @download.verified_from_disk} title="Note">
+        Found already complete at the save location — verified against the
+        torrent's piece hashes, nothing was downloaded this session.
+      </:item>
       <:item :if={@download.state == :downloading} title="Peers">
         {peer_count_text(@peer_stats)}
       </:item>
@@ -712,6 +716,13 @@ defmodule FluxWeb.DownloadLive.Index do
   defp state_badge_class(:completed), do: "badge-success"
   defp state_badge_class(:failed), do: "badge-error"
   defp state_badge_class(:checking), do: "badge-neutral"
+
+  # A download that reached :completed via initial disk verification (the
+  # file was already fully intact at save_path) never actually transferred
+  # anything through this session — labeled distinctly so it doesn't read
+  # as a multi-GB file that impossibly finished in seconds.
+  defp state_label(%{state: :completed, verified_from_disk: true}), do: "already on disk"
+  defp state_label(%{state: state}), do: state
 
   defp ratio(%{downloaded: 0, uploaded: 0}), do: "0.00"
   defp ratio(%{downloaded: 0}), do: "∞"

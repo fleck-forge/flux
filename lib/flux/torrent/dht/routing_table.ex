@@ -14,7 +14,10 @@ defmodule Flux.Torrent.Dht.RoutingTable do
   defstruct [:our_id, nodes: %{}]
 
   @type node_entry :: {binary(), :inet.ip4_address(), :inet.port_number()}
-  @type t :: %__MODULE__{our_id: binary(), nodes: %{binary() => {:inet.ip4_address(), :inet.port_number()}}}
+  @type t :: %__MODULE__{
+          our_id: binary(),
+          nodes: %{binary() => {:inet.ip4_address(), :inet.port_number()}}
+        }
 
   @spec new(binary()) :: t()
   def new(our_id), do: %__MODULE__{our_id: our_id}

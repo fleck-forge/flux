@@ -32,7 +32,8 @@ defmodule Flux.Torrent do
   Adds a torrent from a magnet URI and starts downloading it. Metadata
   (name, size, piece layout) isn't known yet — it's resolved asynchronously
   via BEP 9/10 peer exchange, after which the download's row is updated in
-  place. A magnet with no tracker parameters fails fast (no DHT fallback).
+  place. A magnet with no tracker parameters still works — peers are found
+  via DHT instead.
   """
   @spec add_magnet(String.t(), String.t()) :: {:ok, Ecto.UUID.t()} | {:error, term()}
   def add_magnet(magnet_uri, save_path) do

@@ -106,7 +106,8 @@ defmodule Flux.Torrent.Dht.Krpc do
   def decode_compact_nodes(nil), do: []
 
   def decode_compact_nodes(bin) when is_binary(bin) and rem(byte_size(bin), 26) == 0 do
-    for <<node_id::binary-size(20), a, b, c, d, port::16 <- bin>>, do: {node_id, {a, b, c, d}, port}
+    for <<node_id::binary-size(20), a, b, c, d, port::16 <- bin>>,
+      do: {node_id, {a, b, c, d}, port}
   end
 
   def decode_compact_nodes(_), do: []

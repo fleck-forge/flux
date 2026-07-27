@@ -14,6 +14,7 @@ defmodule Flux.Torrent.PeerConnection do
   require Logger
 
   alias Flux.Torrent.{WireProtocol, Storage}
+  alias Flux.Torrent.Utp
 
   @keep_alive_interval 90_000
   @handshake_timeout 10_000
@@ -22,6 +23,7 @@ defmodule Flux.Torrent.PeerConnection do
 
   defstruct [
     :socket,
+    :utp_pid,
     :session_pid,
     :storage_pid,
     :info_hash,
@@ -32,6 +34,7 @@ defmodule Flux.Torrent.PeerConnection do
     :our_bitfield,
     :metadata_size,
     :raw_info_bytes,
+    transport: :tcp,
     am_choking: true,
     am_interested: false,
     peer_choking: true,
@@ -51,7 +54,8 @@ defmodule Flux.Torrent.PeerConnection do
   `nil` if metadata isn't known yet — serving is impossible until it is),
   `:piece_count` (may be `nil` pre-metadata), `:our_bitfield` (wire bytes
   or `nil`), and optionally `:raw_info_bytes`/`:metadata_size` (to serve
-  ut_metadata to peers once we have it).
+  ut_metadata to peers once we have it), and `:transport` (`:tcp` (default)
+  or `:utp` — v1 uTP is outbound-only, so this only matters here).
   """
   def start_link_outbound(address, port, opts) do
     GenServer.start_link(__MODULE__, {:outbound, address, port, opts})
@@ -122,7 +126,10 @@ defmodule Flux.Torrent.PeerConnection do
   end
 
   @impl true
-  def handle_continue(:connect_outbound, %{remote_address: {address, port}} = state) do
+  def handle_continue(
+        :connect_outbound,
+        %{transport: :tcp, remote_address: {address, port}} = state
+      ) do
     case :gen_tcp.connect(
            address,
            port,
@@ -130,7 +137,23 @@ defmodule Flux.Torrent.PeerConnection do
            @handshake_timeout
          ) do
       {:ok, socket} ->
-        case do_outbound_handshake(%{state | socket: socket}) do
+        case do_outbound_handshake_tcp(%{state | socket: socket}) do
+          {:ok, state} -> {:noreply, state}
+          {:stop, reason} -> {:stop, reason, state}
+        end
+
+      {:error, reason} ->
+        {:stop, reason, state}
+    end
+  end
+
+  def handle_continue(
+        :connect_outbound,
+        %{transport: :utp, remote_address: {address, port}} = state
+      ) do
+    case Utp.Manager.connect(address, port, @handshake_timeout) do
+      {:ok, utp_pid} ->
+        case do_outbound_handshake_utp(%{state | utp_pid: utp_pid}) do
           {:ok, state} -> {:noreply, state}
           {:stop, reason} -> {:stop, reason, state}
         end
@@ -143,6 +166,7 @@ defmodule Flux.Torrent.PeerConnection do
   defp build_state(socket, opts) do
     %__MODULE__{
       socket: socket,
+      transport: Keyword.get(opts, :transport, :tcp),
       session_pid: Keyword.fetch!(opts, :session_pid),
       storage_pid: Keyword.get(opts, :storage_pid),
       info_hash: Keyword.fetch!(opts, :info_hash),
@@ -154,7 +178,7 @@ defmodule Flux.Torrent.PeerConnection do
     }
   end
 
-  defp do_outbound_handshake(state) do
+  defp do_outbound_handshake_tcp(state) do
     handshake =
       WireProtocol.encode_handshake(state.info_hash, state.our_peer_id, extended_reserved())
 
@@ -169,6 +193,49 @@ defmodule Flux.Torrent.PeerConnection do
       end
     else
       {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  # uTP has no synchronous "recv N bytes" primitive (`Utp.Socket` only ever
+  # pushes `{:utp_data, pid, binary}` messages) — so the handshake read is a
+  # small bounded `receive` right here instead, blocking this process just
+  # like `:gen_tcp.recv/3` already does for the TCP path above.
+  defp do_outbound_handshake_utp(state) do
+    handshake =
+      WireProtocol.encode_handshake(state.info_hash, state.our_peer_id, extended_reserved())
+
+    raw_send(state, handshake)
+
+    case utp_recv_exactly(state.utp_pid, 68, <<>>, @handshake_timeout) do
+      {:ok, remote_handshake_bin, leftover} ->
+        case WireProtocol.decode_handshake(remote_handshake_bin) do
+          {:ok, %{info_hash: remote_info_hash, peer_id: peer_id}, ""} ->
+            if remote_info_hash == state.info_hash do
+              finish_handshake(%{state | remote_peer_id: peer_id, recv_buffer: leftover})
+            else
+              {:stop, :info_hash_mismatch}
+            end
+
+          _ ->
+            {:stop, :bad_handshake}
+        end
+
+      {:error, reason} ->
+        {:stop, reason}
+    end
+  end
+
+  defp utp_recv_exactly(_pid, needed, buffer, _timeout) when byte_size(buffer) >= needed do
+    <<data::binary-size(needed), rest::binary>> = buffer
+    {:ok, data, rest}
+  end
+
+  defp utp_recv_exactly(pid, needed, buffer, timeout) do
+    receive do
+      {:utp_data, ^pid, data} -> utp_recv_exactly(pid, needed, buffer <> data, timeout)
+      {:utp_closed, ^pid, reason} -> {:error, reason}
+    after
+      timeout -> {:error, :timeout}
     end
   end
 
@@ -194,7 +261,10 @@ defmodule Flux.Torrent.PeerConnection do
     send_extended_handshake(state)
     if state.our_bitfield, do: send_wire(state, {:bitfield, state.our_bitfield})
 
-    :ok = :inet.setopts(state.socket, active: :once)
+    # uTP has no equivalent flow-control mode to toggle — `Utp.Socket`
+    # pushes `{:utp_data, pid, binary}` as it arrives, unconditionally.
+    if state.transport == :tcp, do: :ok = :inet.setopts(state.socket, active: :once)
+
     ref = schedule_keep_alive()
     GenServer.cast(state.session_pid, {:peer_connected, self(), state.remote_peer_id})
     {:ok, %{state | keep_alive_ref: ref}}
@@ -207,7 +277,7 @@ defmodule Flux.Torrent.PeerConnection do
         state.metadata_size
       )
 
-    :gen_tcp.send(state.socket, payload)
+    raw_send(state, payload)
   end
 
   defp schedule_keep_alive do
@@ -248,7 +318,7 @@ defmodule Flux.Torrent.PeerConnection do
 
     if peer_ext_id do
       payload = WireProtocol.encode_ut_metadata_request(peer_ext_id, piece_index)
-      :gen_tcp.send(state.socket, payload)
+      raw_send(state, payload)
     end
 
     {:noreply, state}
@@ -268,6 +338,14 @@ defmodule Flux.Torrent.PeerConnection do
   def handle_info({:tcp_error, socket, reason}, %{socket: socket} = state),
     do: disconnect(state, reason)
 
+  def handle_info({:utp_data, pid, data}, %{utp_pid: pid} = state) do
+    state = %{state | recv_buffer: state.recv_buffer <> data}
+    {:noreply, process_buffer(state)}
+  end
+
+  def handle_info({:utp_closed, pid, reason}, %{utp_pid: pid} = state),
+    do: disconnect(state, reason)
+
   def handle_info(:send_keep_alive, state) do
     send_wire(state, :keep_alive)
     {:noreply, %{state | keep_alive_ref: schedule_keep_alive()}}
@@ -280,7 +358,11 @@ defmodule Flux.Torrent.PeerConnection do
 
   @impl true
   def terminate(_reason, state) do
-    if state.socket, do: :gen_tcp.close(state.socket)
+    case state.transport do
+      :tcp -> if state.socket, do: :gen_tcp.close(state.socket)
+      :utp -> if state.utp_pid, do: Utp.Socket.close(state.utp_pid)
+    end
+
     :ok
   end
 
@@ -398,9 +480,9 @@ defmodule Flux.Torrent.PeerConnection do
   defp handle_ut_metadata_request(state, ext_id, piece_index) do
     if state.raw_info_bytes do
       payload = WireProtocol.encode_ut_metadata_data(ext_id, piece_index, state.raw_info_bytes)
-      :gen_tcp.send(state.socket, payload)
+      raw_send(state, payload)
     else
-      :gen_tcp.send(state.socket, WireProtocol.encode_ut_metadata_reject(ext_id, piece_index))
+      raw_send(state, WireProtocol.encode_ut_metadata_reject(ext_id, piece_index))
     end
 
     state
@@ -418,9 +500,12 @@ defmodule Flux.Torrent.PeerConnection do
   defp mark_have(nil, _index, _piece_count), do: nil
   defp mark_have(bf, index, _piece_count), do: Flux.Torrent.Bitfield.set(bf, index)
 
-  defp send_wire(state, message) do
-    :gen_tcp.send(state.socket, WireProtocol.encode_message(message))
-  end
+  defp send_wire(state, message), do: raw_send(state, WireProtocol.encode_message(message))
+
+  defp raw_send(%{transport: :tcp} = state, binary), do: :gen_tcp.send(state.socket, binary)
+
+  defp raw_send(%{transport: :utp} = state, binary),
+    do: Utp.Socket.send_data(state.utp_pid, binary)
 
   defp notify(state, message), do: GenServer.cast(state.session_pid, message)
 end

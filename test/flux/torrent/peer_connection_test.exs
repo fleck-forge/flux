@@ -2,6 +2,7 @@ defmodule Flux.Torrent.PeerConnectionTest do
   use ExUnit.Case, async: true
 
   alias Flux.Torrent.{PeerConnection, WireProtocol, Storage, MetaInfo}
+  alias Flux.Torrent.Utp.Packet
 
   @info_hash :crypto.hash(:sha, "test-torrent")
   @our_peer_id :crypto.hash(:sha, "us")
@@ -54,6 +55,69 @@ defmodule Flux.Torrent.PeerConnectionTest do
     PeerConnection.start_link_outbound({127, 0, 0, 1}, port, Keyword.merge(default_opts, opts))
   end
 
+  ## uTP transport helpers — a raw `:gen_udp` fake peer speaking BEP 29
+  # directly (mirrors the DHT/tracker tests' "fake node over raw sockets"
+  # style, no mocking library), used to exercise `PeerConnection`'s
+  # `transport: :utp` path end to end.
+
+  defp open_fake_utp_peer do
+    {:ok, socket} = :gen_udp.open(0, [:binary, active: false])
+    socket
+  end
+
+  defp utp_recv(socket, timeout \\ 2000) do
+    {:ok, {ip, port, data}} = :gen_udp.recv(socket, 0, timeout)
+    {:ok, packet} = Packet.decode(data)
+    {packet, ip, port}
+  end
+
+  defp utp_send(socket, ip, port, packet),
+    do: :gen_udp.send(socket, ip, port, Packet.encode(packet))
+
+  # Completes the uTP handshake (SYN/STATE) and then the BitTorrent
+  # handshake riding on top of it (as a single ST_DATA chunk each way) —
+  # the connection_id relationship follows BEP 29 exactly: the SYN's
+  # connection_id (X) is what the *initiator* listens on, so it's what we
+  # (the fake peer) must keep using; X+1 is what the initiator uses toward
+  # us instead.
+  defp fake_utp_handshake(socket, opts \\ []) do
+    {syn, ip, port} = utp_recv(socket)
+    assert syn.type == :st_syn
+
+    state_packet = %{
+      type: :st_state,
+      connection_id: syn.connection_id,
+      timestamp_us: 0,
+      timestamp_diff_us: 0,
+      wnd_size: 1_048_576,
+      seq_nr: 100,
+      ack_nr: syn.seq_nr,
+      payload: <<>>
+    }
+
+    utp_send(socket, ip, port, state_packet)
+
+    {handshake_packet, ^ip, ^port} = utp_recv(socket)
+    {:ok, decoded, ""} = WireProtocol.decode_handshake(handshake_packet.payload)
+
+    remote_info_hash = Keyword.get(opts, :info_hash, @info_hash)
+    reply_handshake = WireProtocol.encode_handshake(remote_info_hash, @remote_peer_id)
+
+    reply_packet = %{
+      type: :st_data,
+      connection_id: syn.connection_id,
+      timestamp_us: 0,
+      timestamp_diff_us: 0,
+      wnd_size: 1_048_576,
+      seq_nr: 101,
+      ack_nr: handshake_packet.seq_nr,
+      payload: reply_handshake
+    }
+
+    utp_send(socket, ip, port, reply_packet)
+    {decoded, ip, port}
+  end
+
   test "successful handshake notifies the session with the remote peer_id" do
     {listen_socket, port} = listen()
 
@@ -63,6 +127,20 @@ defmodule Flux.Torrent.PeerConnectionTest do
 
     assert decoded.info_hash == @info_hash
     assert_receive {:"$gen_cast", {:peer_connected, _pid, @remote_peer_id}}, 1000
+  end
+
+  test "successful handshake over uTP notifies the session with the remote peer_id" do
+    fake_peer = open_fake_utp_peer()
+    {:ok, fake_port} = :inet.port(fake_peer)
+
+    task = Task.async(fn -> fake_utp_handshake(fake_peer) end)
+    assert {:ok, _pid} = start_outbound(fake_port, transport: :utp)
+    {decoded, _ip, _port} = Task.await(task)
+
+    assert decoded.info_hash == @info_hash
+    assert_receive {:"$gen_cast", {:peer_connected, _pid, @remote_peer_id}}, 2000
+
+    :gen_udp.close(fake_peer)
   end
 
   test "rejects a peer whose handshake info_hash doesn't match" do

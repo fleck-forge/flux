@@ -27,6 +27,11 @@ defmodule Flux.Downloads.Download do
     field :uploaded, :integer, default: 0
     field :error_message, :string
 
+    # True when this download reached :completed via initial disk
+    # verification (the file already existed, fully intact, at save_path)
+    # rather than by actually transferring data through this session.
+    field :verified_from_disk, :boolean, default: false
+
     # JSON-encoded list of tracker tiers (`[["url1"],["url2","url3"]]`),
     # per BEP 12 — these live in a .torrent's top-level dict, not in
     # `info_dict`, so they need their own storage to survive a restart.
@@ -51,7 +56,8 @@ defmodule Flux.Downloads.Download do
       :save_path,
       :uploaded,
       :error_message,
-      :trackers
+      :trackers,
+      :verified_from_disk
     ])
     |> validate_required([:name, :info_hash, :total_length, :save_path])
     |> validate_number(:total_length, greater_than_or_equal_to: 0)

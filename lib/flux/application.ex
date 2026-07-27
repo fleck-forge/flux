@@ -40,6 +40,8 @@ defmodule Flux.Application do
         # One DHT node and one shared uTP socket for the whole app (not per
         # torrent) — matches how real clients run exactly one of each.
         {Flux.Torrent.Dht, port: Application.get_env(:flux, :torrent, [])[:dht_port] || 6881},
+        {Flux.Torrent.Utp.Manager,
+         port: Application.get_env(:flux, :torrent, [])[:utp_port] || 51414},
         # Start to serve requests, typically the last entry
         FluxWeb.Endpoint
       ] ++ desktop_window_child()

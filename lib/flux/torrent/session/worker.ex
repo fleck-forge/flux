@@ -28,13 +28,15 @@ defmodule Flux.Torrent.Session.Worker do
     Choker,
     TrackerClient,
     Storage,
-    PeerConnection
+    PeerConnection,
+    Dht
   }
 
   @block_size 16_384
   @max_peers 30
   @choke_interval 10_000
   @peer_fill_interval 5_000
+  @dht_tick_interval 60_000
   @min_announce_interval 30
 
   defstruct [
@@ -52,6 +54,7 @@ defmodule Flux.Torrent.Session.Worker do
     pending: %{},
     known_peers: MapSet.new(),
     tried_peers: MapSet.new(),
+    dht_lookup_pid: nil,
     choke_state: %{},
     unchoked_by: MapSet.new(),
     picker: nil,
@@ -88,6 +91,11 @@ defmodule Flux.Torrent.Session.Worker do
       downloaded: download.downloaded
     }
 
+    # DHT gives every session a peer-discovery path independent of trackers
+    # (including a magnet with none at all), so it's scheduled unconditionally
+    # here rather than only once metadata/storage exist below.
+    schedule_dht_tick(0)
+
     cond do
       download.info_dict ->
         with {:ok, meta_info} <- MetaInfo.parse_info_dict(download.info_dict, trackers) do
@@ -101,14 +109,6 @@ defmodule Flux.Torrent.Session.Worker do
 
             :ignore
         end
-
-      trackers == [] ->
-        Downloads.mark_failed(
-          download,
-          "no trackers in magnet link and DHT is not supported — add a magnet link with tracker (&tr=) parameters"
-        )
-
-        :ignore
 
       true ->
         schedule_announce(0)
@@ -141,7 +141,12 @@ defmodule Flux.Torrent.Session.Worker do
         Downloads.update_download(download, %{
           downloaded: downloaded_bytes,
           bitfield: Bitfield.to_wire(verified_bitfield),
-          state: final_state
+          state: final_state,
+          # Completing right here (before a single peer connection this
+          # session) means the file was already fully intact on disk —
+          # surfaced distinctly in the UI so it doesn't look like a
+          # multi-GB download that impossibly finished in seconds.
+          verified_from_disk: final_state == :completed
         })
 
       picker =
@@ -160,6 +165,12 @@ defmodule Flux.Torrent.Session.Worker do
           our_bitfield: verified_bitfield,
           downloaded: downloaded_bytes
       }
+
+      # For a magnet, peers can already be connected (found via tracker/DHT
+      # and used to fetch this very metadata) before `meta_info` existed —
+      # `:interested` is only sent at `peer_connected` time when metadata is
+      # already known, so anyone already connected needs it sent now instead.
+      for {_peer_id, pid} <- state.peers, do: PeerConnection.send_message(pid, :interested)
 
       schedule_choke_tick()
       schedule_peer_fill_tick()
@@ -230,6 +241,27 @@ defmodule Flux.Torrent.Session.Worker do
     {:noreply, connect_to_peers(state, MapSet.to_list(state.known_peers))}
   end
 
+  # A DHT lookup (multi-round, several seconds) runs in its own spawned
+  # process rather than inline here, so it never blocks announce/choke/peer
+  # handling — only one runs at a time (`dht_lookup_pid` guards re-entry;
+  # cleared again once its :DOWN arrives below, whether it finished normally
+  # or crashed).
+  def handle_info(:dht_tick, state) do
+    schedule_dht_tick()
+    {:noreply, start_dht_lookup(state)}
+  end
+
+  def handle_info({:dht_peers_result, pid, {:ok, peers}}, %{dht_lookup_pid: pid} = state) do
+    state = %{state | known_peers: MapSet.union(state.known_peers, MapSet.new(peers))}
+    {:noreply, connect_to_peers(state, peers)}
+  end
+
+  def handle_info({:dht_peers_result, _pid, _result}, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, %{dht_lookup_pid: pid} = state) do
+    {:noreply, %{state | dht_lookup_pid: nil}}
+  end
+
   def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
     case Map.get(state.peer_info, pid) do
       nil ->
@@ -237,9 +269,9 @@ defmodule Flux.Torrent.Session.Worker do
         # here (as this monitored process exiting), not as an error return
         # from starting it, since the connect itself is asynchronous now.
         case Map.get(state.pending, pid) do
-          {ip, port} ->
+          {ip, port, transport} ->
             Logger.debug(
-              "Session.Worker: connection to #{:inet.ntoa(ip)}:#{port} failed (#{inspect(reason)})"
+              "Session.Worker: connection to #{:inet.ntoa(ip)}:#{port} over #{transport} failed (#{inspect(reason)})"
             )
 
           nil ->
@@ -454,13 +486,42 @@ defmodule Flux.Torrent.Session.Worker do
   defp schedule_peer_fill_tick,
     do: Process.send_after(self(), :peer_fill_tick, @peer_fill_interval)
 
+  defp schedule_dht_tick(delay_ms \\ @dht_tick_interval),
+    do: Process.send_after(self(), :dht_tick, delay_ms)
+
+  # Only one lookup in flight at a time — `dht_lookup_pid` is cleared by the
+  # :DOWN handler once it exits (normally or otherwise), letting the next
+  # tick start a fresh one.
+  defp start_dht_lookup(%{dht_lookup_pid: pid} = state) when is_pid(pid), do: state
+
+  defp start_dht_lookup(state) do
+    info_hash = state.info_hash
+    parent = self()
+
+    {pid, _ref} =
+      spawn_monitor(fn -> send(parent, {:dht_peers_result, self(), Dht.get_peers(info_hash)}) end)
+
+    %{state | dht_lookup_pid: pid}
+  end
+
+  # `peer_list` is plain `{ip, port}` addresses (from trackers/DHT, which
+  # know nothing about transport) — each expands to two independent
+  # candidates here, one per transport, since a TCP attempt to an address
+  # failing tells us nothing about whether uTP to that same address would
+  # work (and vice versa; this is the entire point of adding uTP: some
+  # real-world peers are only reachable over one or the other).
   defp connect_to_peers(state, peer_list) do
     active = MapSet.new(Map.values(state.pending) ++ Map.values(state.peer_addresses))
     slots = @max_peers - map_size(state.peers) - map_size(state.pending)
 
-    candidates = Enum.reject(peer_list, fn addr -> MapSet.member?(active, addr) end)
+    candidates =
+      for {ip, port} <- peer_list,
+          transport <- [:tcp, :utp],
+          candidate = {ip, port, transport},
+          not MapSet.member?(active, candidate),
+          do: candidate
 
-    # Never-tried addresses first, previously-failed ones only to fill any
+    # Never-tried candidates first, previously-failed ones only to fill any
     # remaining slots — otherwise a handful of addresses that failed once
     # immediately become eligible again (nothing else marks them as
     # recently-failed) and, since candidate ordering is otherwise stable,
@@ -472,11 +533,13 @@ defmodule Flux.Torrent.Session.Worker do
 
     (untried ++ previously_tried)
     |> Enum.take(max(slots, 0))
-    |> Enum.reduce(state, fn {ip, port}, acc -> start_peer_connection(acc, ip, port) end)
+    |> Enum.reduce(state, fn {ip, port, transport}, acc ->
+      start_peer_connection(acc, ip, port, transport)
+    end)
   end
 
-  defp start_peer_connection(state, ip, port) do
-    state = %{state | tried_peers: MapSet.put(state.tried_peers, {ip, port})}
+  defp start_peer_connection(state, ip, port, transport) do
+    state = %{state | tried_peers: MapSet.put(state.tried_peers, {ip, port, transport})}
 
     opts = [
       session_pid: self(),
@@ -486,11 +549,12 @@ defmodule Flux.Torrent.Session.Worker do
       piece_count: piece_count(state),
       our_bitfield: our_bitfield_wire(state),
       raw_info_bytes: state.meta_info && state.meta_info.raw_info_bytes,
-      metadata_size: state.meta_info && byte_size(state.meta_info.raw_info_bytes)
+      metadata_size: state.meta_info && byte_size(state.meta_info.raw_info_bytes),
+      transport: transport
     ]
 
     child_spec = %{
-      id: {PeerConnection, ip, port, System.unique_integer()},
+      id: {PeerConnection, ip, port, transport, System.unique_integer()},
       start: {PeerConnection, :start_link_outbound, [ip, port, opts]},
       restart: :temporary
     }
@@ -504,7 +568,7 @@ defmodule Flux.Torrent.Session.Worker do
     case result do
       {:ok, pid} ->
         Process.monitor(pid)
-        %{state | pending: Map.put(state.pending, pid, {ip, port})}
+        %{state | pending: Map.put(state.pending, pid, {ip, port, transport})}
 
       {:error, reason} ->
         # The connect itself is async (handled by the started process via
@@ -512,7 +576,7 @@ defmodule Flux.Torrent.Session.Worker do
         # branch only fires for a supervisor-level failure to even start
         # the child process (e.g. hitting :max_children).
         Logger.debug(
-          "Session.Worker: could not start a connection process for #{:inet.ntoa(ip)}:#{port} (#{inspect(reason)})"
+          "Session.Worker: could not start a connection process for #{:inet.ntoa(ip)}:#{port} over #{transport} (#{inspect(reason)})"
         )
 
         state

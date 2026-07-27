@@ -4,13 +4,10 @@ defmodule Flux.Torrent.Magnet do
   @moduledoc """
   Parses `magnet:` URIs (the `xt=urn:btih:`, `dn=`, `tr=` parameters) into the
   minimum needed to start a session before real metadata has been fetched: an
-  info_hash, an optional display name, and a tracker list.
-
-  Deliberately does not support DHT-only (trackerless) magnets — those are
-  out of scope (see `Flux.Torrent`'s moduledoc); a magnet with no `tr=`
-  parameters parses successfully here (parsing is a purely syntactic
-  concern) but callers should treat an empty `trackers` list as a
-  fail-fast condition.
+  info_hash, an optional display name, and a tracker list. A magnet with no
+  `tr=` parameters parses to an empty `trackers` list and still works —
+  `Flux.Torrent.Dht` is the peer-discovery (and, for magnets, metadata
+  discovery) path in that case.
   """
 
   @type t :: %{info_hash: binary(), name: String.t() | nil, trackers: [String.t()]}

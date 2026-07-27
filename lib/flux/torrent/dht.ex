@@ -32,7 +32,14 @@ defmodule Flux.Torrent.Dht do
     {~c"router.utorrent.com", 6881}
   ]
 
-  defstruct [:our_id, :socket, :routing_table, :token_secret, waiters: %{}, transaction_counter: 0]
+  defstruct [
+    :our_id,
+    :socket,
+    :routing_table,
+    :token_secret,
+    waiters: %{},
+    transaction_counter: 0
+  ]
 
   ## Client API
 
@@ -64,7 +71,11 @@ defmodule Flux.Torrent.Dht do
   handles one message at a time) before this call is waiting for it.
   """
   def query_and_wait(dest, query_name, args_pairs, timeout \\ 3000) do
-    GenServer.call(__MODULE__, {:query_and_wait, dest, query_name, args_pairs, timeout}, timeout + 1000)
+    GenServer.call(
+      __MODULE__,
+      {:query_and_wait, dest, query_name, args_pairs, timeout},
+      timeout + 1000
+    )
   end
 
   def routing_table_snapshot, do: GenServer.call(__MODULE__, :routing_table_snapshot)
@@ -85,7 +96,10 @@ defmodule Flux.Torrent.Dht do
     case routing_table_snapshot() do
       {:ok, table} ->
         initial = RoutingTable.closest_nodes(table, info_hash, 20)
-        {peers, _queried, _candidates} = do_lookup(info_hash, initial, MapSet.new(), MapSet.new(), alpha, max_rounds, timeout)
+
+        {peers, _queried, _candidates} =
+          do_lookup(info_hash, initial, MapSet.new(), MapSet.new(), alpha, max_rounds, timeout)
+
         {:ok, MapSet.to_list(peers)}
 
       _ ->
@@ -93,7 +107,8 @@ defmodule Flux.Torrent.Dht do
     end
   end
 
-  defp do_lookup(_info_hash, _candidates, queried, peers, _alpha, 0, _timeout), do: {peers, queried, []}
+  defp do_lookup(_info_hash, _candidates, queried, peers, _alpha, 0, _timeout),
+    do: {peers, queried, []}
 
   defp do_lookup(info_hash, candidates, queried, peers, alpha, rounds_left, timeout) do
     to_query =
@@ -109,24 +124,36 @@ defmodule Flux.Torrent.Dht do
         |> Enum.map(fn {node_id, ip, port} -> query_one(info_hash, node_id, ip, port, timeout) end)
         |> Enum.reduce({peers, [], queried}, &fold_lookup_result/2)
 
-      known_ids = MapSet.new(candidates, fn {id, _, _} -> id end)
+      if MapSet.size(new_peers) > 0 do
+        # Real clients keep refining until the closest known node stops
+        # improving, but that means fully crawling however much of the
+        # (potentially enormous, real-world) DHT is reachable from here —
+        # not worth it just to find a few more redundant peers when we
+        # already have at least one to start downloading from. The next
+        # tick runs another lookup regardless, so a shallow "stop at first
+        # hit" search costs nothing beyond mild redundancy.
+        {new_peers, new_queried, candidates}
+      else
+        known_ids = MapSet.new(candidates, fn {id, _, _} -> id end)
 
-      fresh_nodes =
-        new_nodes
-        |> Enum.uniq_by(fn {id, _ip, _port} -> id end)
-        |> Enum.reject(fn {id, _ip, _port} -> MapSet.member?(known_ids, id) end)
+        fresh_nodes =
+          new_nodes
+          |> Enum.uniq_by(fn {id, _ip, _port} -> id end)
+          |> Enum.reject(fn {id, _ip, _port} -> MapSet.member?(known_ids, id) end)
 
-      merged =
-        (candidates ++ fresh_nodes)
-        |> Enum.uniq_by(fn {id, _ip, _port} -> id end)
-        |> Enum.sort_by(fn {id, _ip, _port} -> RoutingTable.distance(info_hash, id) end)
+        merged =
+          (candidates ++ fresh_nodes)
+          |> Enum.uniq_by(fn {id, _ip, _port} -> id end)
+          |> Enum.sort_by(fn {id, _ip, _port} -> RoutingTable.distance(info_hash, id) end)
 
-      do_lookup(info_hash, merged, new_queried, new_peers, alpha, rounds_left - 1, timeout)
+        do_lookup(info_hash, merged, new_queried, new_peers, alpha, rounds_left - 1, timeout)
+      end
     end
   end
 
   defp fold_lookup_result({:ok, node_id, found_peers, found_nodes}, {p_acc, n_acc, q_acc}) do
-    {MapSet.union(p_acc, MapSet.new(found_peers)), n_acc ++ found_nodes, MapSet.put(q_acc, node_id)}
+    {MapSet.union(p_acc, MapSet.new(found_peers)), n_acc ++ found_nodes,
+     MapSet.put(q_acc, node_id)}
   end
 
   defp fold_lookup_result({:error, node_id}, {p_acc, n_acc, q_acc}) do
@@ -177,7 +204,11 @@ defmodule Flux.Torrent.Dht do
     {:reply, if(tid, do: {:ok, tid}, else: {:error, :no_socket}), state}
   end
 
-  def handle_call({:query_and_wait, _dest, _query_name, _args_pairs, _timeout}, _from, %{socket: nil} = state) do
+  def handle_call(
+        {:query_and_wait, _dest, _query_name, _args_pairs, _timeout},
+        _from,
+        %{socket: nil} = state
+      ) do
     {:reply, {:error, :no_socket}, state}
   end
 
@@ -201,8 +232,11 @@ defmodule Flux.Torrent.Dht do
     state =
       Enum.reduce(@bootstrap_nodes, state, fn {host, port}, acc ->
         case :inet.getaddr(host, :inet) do
-          {:ok, ip} -> elem(do_send_query(acc, {ip, port}, "find_node", [{"target", acc.our_id}]), 1)
-          {:error, _reason} -> acc
+          {:ok, ip} ->
+            elem(do_send_query(acc, {ip, port}, "find_node", [{"target", acc.our_id}]), 1)
+
+          {:error, _reason} ->
+            acc
         end
       end)
 
